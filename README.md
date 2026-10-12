@@ -2,35 +2,47 @@
 
 Authenticated TypeSafe-compatible `POST /v1/systemone` backed by Cloudflare `typesafe/jev`.
 
-## Deploy
+## Deploy Worker
 
 ```sh
 npm install
 wrangler secret put PROXY_API_KEY
-wrangler secret put CF_AI_API_TOKEN   # Account → Workers AI → Read (used inside APAC DO only)
+wrangler secret put RELAY_URL    # https://<public-host>/v1/systemone
+wrangler secret put RELAY_KEY    # shared with the relay process
 npm run deploy
 ```
 
-## Why custom domain failed
+`CF_AI_API_TOKEN` is **not** required on the Worker when LHR traffic uses the relay. Put that token on the **relay host** instead (see [`relay/README.md`](relay/README.md)).
 
-| Path | Result |
+## Why an off-platform relay
+
+Same Mac, same payload, same `PROXY_API_KEY`:
+
+| Target | Result |
 | --- | --- |
-| Edge `env.AI.run` on LHR ingress | `AiGatewayError` `2002` |
-| Worker-originated account REST from LHR | same `2002` (`Model execution failed`) |
-| Same token REST from Mac / outside CF | **200** `jev-1.13.0` |
-| Durable Object id `"jev"` first created under LHR | hint ignored on later `get()`; DO stayed on broken path |
+| `jev-proxy.topviewai.app` (cf-ray `*-LHR`) | **502** `AiGatewayError` `2002` |
+| `*.imabing.workers.dev` (cf-ray `*-SIN`) | **200** `jev-1.13.0` |
+| Account REST `/ai/run` from outside CF | **200** |
+| Worker / DO / Worker-origin REST on LHR path | **2002** |
 
-## Current recovery
+On-platform AI only works when the **ingress** colo is healthy (SIN). Durable Objects and Service Bindings did not escape LHR AI Gateway failure. Public Worker→workers.dev hop previously **522**’d.
 
-1. On ingress `colo=LHR`: **skip edge REST/binding** → Durable Object `idFromName("jev-apac-v2")` with `locationHint: "apac-se"` (new id so the hint applies).
-2. Inside the DO: **`env.AI.run` first**, REST only if binding fails.
-3. Healthy ingress: edge binding, then the same APAC-SE DO on failure.
+## Inference order
 
-Look for logs: `Jev edge → Durable Object`, `Jev DO path start`, `Jev DO path ok` (`via: binding|rest`).
+1. Ingress `colo=LHR` → **off-platform relay** (`RELAY_URL` + `RELAY_KEY`)
+2. Other colos → `env.AI.run`; on `2002` / “Model execution failed” → relay if configured
 
-If a **fresh** APAC-SE DO still cannot run binding or Worker REST, the next escape hatch is an **off-platform relay** (Mac/box/CI calling account `/ai/run` and returning the result), because AI Gateway `2002` appears intrinsic to Cloudflare Worker isolates on this account/path.
+## Stand up the relay (Jeff/box)
 
-## Verify
+```sh
+export RELAY_KEY='...'
+export CF_AI_API_TOKEN='...'   # Account → Workers AI → Read
+node relay/server.mjs
+cloudflared tunnel --url http://127.0.0.1:8788
+# then wrangler secret put RELAY_URL / RELAY_KEY and deploy
+```
+
+## Verify custom domain
 
 ```sh
 curl -sS https://jev-proxy.topviewai.app/health
@@ -50,4 +62,4 @@ curl -sS -D - https://jev-proxy.topviewai.app/v1/systemone \
   }'
 ```
 
-Expect HTTP `200` with `model`, `answers`, and `usage`.
+Expect HTTP `200` with `model`, `answers`, and `usage`. Workers Logs should show `Jev edge → off-platform relay`.

@@ -4,7 +4,6 @@
   "main": "src/index.js",
   "compatibility_date": "2026-10-10",
   "workers_dev": true,
-  // Placement alone does not fix LHR-ingress AI Gateway failures; kept for latency.
   "placement": {
     "region": "aws:ap-southeast-1"
   },
@@ -12,14 +11,11 @@
     { "pattern": "jev-proxy.topviewai.app", "custom_domain": true }
   ],
   "ai": { "binding": "AI" },
-  // Escape hatch: run inference in APAC when LHR-edge Worker REST/binding fails.
-  "durable_objects": {
-    "bindings": [
-      { "name": "JEV", "class_name": "JevInference" }
-    ]
-  },
+  // v1 created JevInference during earlier LHR experiments; v2 removes it.
+  // LHR recovery is now an off-platform relay (RELAY_URL / RELAY_KEY secrets).
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["JevInference"] }
+    { "tag": "v1", "new_sqlite_classes": ["JevInference"] },
+    { "tag": "v2", "deleted_classes": ["JevInference"] }
   ],
   "observability": { "enabled": true, "head_sampling_rate": 1 }
 }

@@ -1,12 +1,5 @@
-const ACCOUNT_ID = "5b6c981ebeb77b3e3566ffc9ba8be751";
-/** Ingress colos where edge env.AI.run / Worker-originated REST both return AiGatewayError 2002. */
+/** Ingress colos where on-platform AI (binding, Worker REST, DO) returns AiGatewayError 2002. */
 const BINDING_UNRELIABLE_COLOS = new Set(["LHR"]);
-/**
- * Fresh DO id + SE-Asia hint. locationHint is honored only on the FIRST get() for an id;
- * do not reuse "jev" (likely first-created under LHR and stuck on the broken path).
- */
-export const DO_OBJECT_NAME = "jev-apac-v2";
-export const DO_LOCATION_HINT = "apac-se";
 
 const json = (value, status = 200) => Response.json(value, {
   status, headers: { "cache-control": "no-store" },
@@ -25,55 +18,31 @@ export const unwrap = output => {
 };
 
 const insufficientCredits = detail => /2021\s*:\s*Insufficient AI Gateway credits/i.test(detail);
+const isGateway2002 = detail => /2002/.test(detail) || /Model execution failed/i.test(detail);
 
 const runBinding = (env, input) => env.AI.run("typesafe/jev", input);
 
-export async function runRest(env, input) {
-  const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/ai/run`, {
+/** Off-platform relay: box/Mac HTTPS endpoint that calls account /ai/run outside the Worker isolate. */
+export async function runRelay(env, input) {
+  if (!env.RELAY_URL || !env.RELAY_KEY) {
+    const err = new Error("RELAY_URL and RELAY_KEY are not configured");
+    err.name = "AiGatewayError";
+    throw err;
+  }
+  console.log("Jev edge → off-platform relay", { relayHost: safeHost(env.RELAY_URL) });
+  const response = await fetch(env.RELAY_URL, {
     method: "POST",
     headers: {
-      authorization: `Bearer ${env.CF_AI_API_TOKEN}`,
+      authorization: `Bearer ${env.RELAY_KEY}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify({ model: "typesafe/jev", input }),
+    body: JSON.stringify({ state: input.state, questions: input.questions }),
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
-    const message = payload?.errors?.[0]?.message ?? `AI REST HTTP ${response.status}`;
-    console.error("Jev REST failed", {
-      restStatus: response.status,
-      restError: message,
-      restCode: payload?.errors?.[0]?.code ?? null,
-    });
-    const err = new Error(message);
-    err.name = "AiGatewayError";
-    err.restStatus = response.status;
-    err.restCode = payload?.errors?.[0]?.code ?? null;
-    throw err;
-  }
-  return payload?.result ?? payload;
-}
-
-/** Run inference inside a never-before-created APAC-SE Durable Object. */
-export async function runDurable(env, input) {
-  if (!env.JEV?.idFromName) {
-    const err = new Error("JEV Durable Object binding is not configured");
-    err.name = "AiGatewayError";
-    throw err;
-  }
-  const stub = env.JEV.get(env.JEV.idFromName(DO_OBJECT_NAME), { locationHint: DO_LOCATION_HINT });
-  console.log("Jev edge → Durable Object", { objectName: DO_OBJECT_NAME, locationHint: DO_LOCATION_HINT });
-  const response = await stub.fetch(new Request("https://jev-do/run", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(input),
-  }));
-  const payload = await response.json().catch(() => null);
-  if (!response.ok) {
-    const message = payload?.error?.message ?? `durable hop HTTP ${response.status}`;
-    console.error("Jev Durable Object failed", {
-      objectName: DO_OBJECT_NAME,
-      locationHint: DO_LOCATION_HINT,
+    const message = payload?.error?.message ?? `relay HTTP ${response.status}`;
+    console.error("Jev relay failed", {
+      relayHost: safeHost(env.RELAY_URL),
       restStatus: response.status,
       restError: message,
     });
@@ -85,67 +54,31 @@ export async function runDurable(env, input) {
   return payload;
 }
 
+const safeHost = url => {
+  try { return new URL(url).host; } catch { return "invalid-relay-url"; }
+};
+
 /**
- * Custom-domain / LHR: skip edge REST (Worker-originated /ai/run also returns 2002) and
- * go straight to a fresh APAC-SE Durable Object. Healthy ingress: try edge binding, then DO.
+ * LHR custom domain: on-platform AI is dead → off-platform relay first.
+ * Healthy ingress (e.g. workers.dev SIN): binding first; relay on 2002 if configured.
  */
 export async function runJev(env, input, { colo = null } = {}) {
   const unreliable = Boolean(colo && BINDING_UNRELIABLE_COLOS.has(colo));
 
   if (unreliable) {
-    return runDurable(env, input);
+    return runRelay(env, input);
   }
 
   try {
     return await runBinding(env, input);
   } catch (cause) {
-    if (!env.JEV?.idFromName) throw cause;
-    console.error("Jev edge binding failed; using APAC Durable Object", {
+    const detail = String(cause?.message ?? "");
+    if (!env.RELAY_URL || !env.RELAY_KEY || !isGateway2002(detail)) throw cause;
+    console.error("Jev edge binding failed; using off-platform relay", {
       colo,
-      errorName: cause instanceof Error ? cause.name : "UnknownError",
-      detail: String(cause?.message ?? "").slice(0, 200),
+      detail: detail.slice(0, 200),
     });
-    return runDurable(env, input);
-  }
-}
-
-/** Fresh APAC-SE isolate for typesafe/jev (binding first, REST only as secondary). */
-export class JevInference {
-  constructor(ctx, env) {
-    this.ctx = ctx;
-    this.env = env;
-  }
-
-  async fetch(request) {
-    const input = await request.json();
-    console.log("Jev DO path start", { objectName: DO_OBJECT_NAME, locationHint: DO_LOCATION_HINT });
-    try {
-      try {
-        const output = await runBinding(this.env, input);
-        console.log("Jev DO path ok", { objectName: DO_OBJECT_NAME, via: "binding" });
-        return Response.json(output);
-      } catch (bindingError) {
-        if (!this.env.CF_AI_API_TOKEN) throw bindingError;
-        console.error("Jev DO binding failed; trying REST", {
-          objectName: DO_OBJECT_NAME,
-          detail: String(bindingError?.message ?? "").slice(0, 200),
-        });
-        const output = await runRest(this.env, input);
-        console.log("Jev DO path ok", { objectName: DO_OBJECT_NAME, via: "rest" });
-        return Response.json(output);
-      }
-    } catch (cause) {
-      const detail = String(cause?.message ?? "");
-      console.error("Jev DO path failed", {
-        objectName: DO_OBJECT_NAME,
-        locationHint: DO_LOCATION_HINT,
-        detail: detail.slice(0, 200),
-      });
-      return Response.json(
-        { error: { message: detail || "Durable inference failed" } },
-        { status: 502 },
-      );
-    }
+    return runRelay(env, input);
   }
 }
 
