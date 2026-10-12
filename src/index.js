@@ -1,9 +1,46 @@
+const ACCOUNT_ID = "5b6c981ebeb77b3e3566ffc9ba8be751";
+
 const json = (value, status = 200) => Response.json(value, {
   status, headers: { "cache-control": "no-store" },
 });
 const error = (status, message) => json({ error: { message } }, status);
 const object = v => v !== null && typeof v === "object" && !Array.isArray(v);
 const description = v => typeof v === "string" || v !== null && typeof v === "object";
+
+const unwrap = output => {
+  const result = output?.answers ? output : output?.result?.answers ? output.result : null;
+  return result?.usage && typeof result.model === "string" ? result : null;
+};
+
+const insufficientCredits = detail => /2021\s*:\s*Insufficient AI Gateway credits/i.test(detail);
+const gatewayUpstream = detail => /^2002\s*:/i.test(detail);
+
+/** Prefer the Workers AI binding; on colo-local AI Gateway 2002, fall back to the account REST API. */
+export async function runJev(env, input) {
+  try {
+    return await env.AI.run("typesafe/jev", input, { gateway: { id: "default" } });
+  } catch (cause) {
+    const detail = String(cause?.message ?? "");
+    if (!gatewayUpstream(detail) || !env.CF_AI_API_TOKEN) throw cause;
+    const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/ai/run`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${env.CF_AI_API_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "typesafe/jev", input }),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = payload?.errors?.[0]?.message ?? `AI REST ${response.status}`;
+      const err = new Error(message);
+      err.name = "AiGatewayError";
+      err.restStatus = response.status;
+      throw err;
+    }
+    return payload?.result ?? payload;
+  }
+}
 
 export default {
   async fetch(request, env) {
@@ -50,23 +87,20 @@ export default {
         return error(422, "Score requires 2-10 criteria");
     }
     try {
-      const output = await env.AI.run(
-        "typesafe/jev",
-        { state: body.state, questions: body.questions },
-        { gateway: { id: "default" } },
-      );
-      const result = output?.answers ? output : output?.result?.answers ? output.result : null;
-      if (!result?.usage || typeof result.model !== "string") return error(502, "Unexpected model response");
+      const output = await runJev(env, { state: body.state, questions: body.questions });
+      const result = unwrap(output);
+      if (!result) return error(502, "Unexpected model response");
       return json(result);
     } catch (cause) {
       const detail = String(cause?.message ?? "");
-      if (/2021\s*:\s*Insufficient AI Gateway credits/i.test(detail))
+      if (insufficientCredits(detail))
         return json({ error: { message: "Cloudflare AI Gateway has insufficient credits", code: "insufficient_credits" } }, 402);
       console.error("Jev inference failed", {
         errorName: cause instanceof Error ? cause.name : "UnknownError",
         upstreamCode: detail.match(/^(\d+)\s*:/)?.[1] ?? null,
-        upstreamStatus: env.AI.lastRequestHttpStatusCode ?? null,
+        upstreamStatus: env.AI.lastRequestHttpStatusCode ?? cause?.restStatus ?? null,
         aiGatewayLogId: env.AI.aiGatewayLogId,
+        colo: request.cf?.colo ?? null,
       });
       return error(502, "Cloudflare model invocation failed");
     }

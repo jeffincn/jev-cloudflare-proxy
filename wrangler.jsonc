@@ -4,6 +4,11 @@
   "main": "src/index.js",
   "compatibility_date": "2026-10-10",
   "workers_dev": true,
+  // Pin execution near APAC: production logs show typesafe/jev succeeding in SIN/NRT
+  // and failing with AiGatewayError 2002 in LHR (custom-domain traffic).
+  "placement": {
+    "region": "aws:ap-southeast-1"
+  },
   "routes": [
     { "pattern": "jev-proxy.topviewai.app", "custom_domain": true }
   ],
