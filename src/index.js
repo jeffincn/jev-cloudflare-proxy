@@ -59,10 +59,13 @@ export default {
       if (!result?.usage || typeof result.model !== "string") return error(502, "Unexpected model response");
       return json(result);
     } catch (cause) {
-      if (/2021\s*:\s*Insufficient AI Gateway credits/i.test(String(cause?.message ?? "")))
+      const detail = String(cause?.message ?? "");
+      if (/2021\s*:\s*Insufficient AI Gateway credits/i.test(detail))
         return json({ error: { message: "Cloudflare AI Gateway has insufficient credits", code: "insufficient_credits" } }, 402);
       console.error("Jev inference failed", {
         errorName: cause instanceof Error ? cause.name : "UnknownError",
+        upstreamCode: detail.match(/^(\d+)\s*:/)?.[1] ?? null,
+        upstreamStatus: env.AI.lastRequestHttpStatusCode ?? null,
         aiGatewayLogId: env.AI.aiGatewayLogId,
       });
       return error(502, "Cloudflare model invocation failed");

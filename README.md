@@ -47,6 +47,6 @@ Keep `.dev.vars` and `.secrets/` private; both are git-ignored.
 }
 ```
 
-The response is the model's native JSON result with `model`, `answers`, and `usage`. Requests are capped at 1 MiB. The proxy does not cache requests or log bodies.
+The response is the model's native JSON result with `model`, `answers`, and `usage`. Requests are capped at 1 MiB. The proxy does not cache requests or log bodies. Inference runs directly through the Cloudflare Workers AI binding.
 
-Cloudflare AI Gateway must have sufficient credits for model inference. If the balance is insufficient, the endpoint returns HTTP `402` with `error.code` set to `insufficient_credits`.
+Jev is a third-party model served through Cloudflare AI Gateway. The Worker explicitly uses the `default` gateway; third-party inference uses Unified Billing and deducts prepaid AI Gateway credits. The gateway's Workers AI billing setting applies to Workers AI models, not to Jev. If the balance is insufficient, the endpoint returns HTTP `402` with `error.code` set to `insufficient_credits`. Other upstream failures are returned as `502` and logged with their error code and status.
