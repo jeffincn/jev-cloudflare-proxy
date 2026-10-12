@@ -4,17 +4,22 @@
   "main": "src/index.js",
   "compatibility_date": "2026-10-10",
   "workers_dev": true,
-  // Placement does not cure LHR-ingress AI Gateway 2002; kept for latency only.
+  // Placement alone does not fix LHR-ingress AI Gateway failures; kept for latency.
   "placement": {
     "region": "aws:ap-southeast-1"
   },
-  // Self service binding: internal re-entry without public URL (workers.dev hop returned 522).
-  "services": [
-    { "binding": "SELF", "service": "jev-cloudflare-proxy" }
-  ],
   "routes": [
     { "pattern": "jev-proxy.topviewai.app", "custom_domain": true }
   ],
   "ai": { "binding": "AI" },
+  // Escape hatch: run inference in APAC when LHR-edge Worker REST/binding fails.
+  "durable_objects": {
+    "bindings": [
+      { "name": "JEV", "class_name": "JevInference" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["JevInference"] }
+  ],
   "observability": { "enabled": true, "head_sampling_rate": 1 }
 }

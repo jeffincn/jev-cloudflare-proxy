@@ -1,6 +1,5 @@
 const ACCOUNT_ID = "5b6c981ebeb77b3e3566ffc9ba8be751";
-const HOP_HEADER = "x-jev-edge-hop";
-/** Ingress colos where env.AI.run(typesafe/jev) returns AiGatewayError 2002 (even with remote-SIN placement). */
+/** Ingress colos where env.AI.run(typesafe/jev) fails (even with remote-SIN placement). */
 const BINDING_UNRELIABLE_COLOS = new Set(["LHR"]);
 
 const json = (value, status = 200) => Response.json(value, {
@@ -10,18 +9,20 @@ const error = (status, message) => json({ error: { message } }, status);
 const object = v => v !== null && typeof v === "object" && !Array.isArray(v);
 const description = v => typeof v === "string" || v !== null && typeof v === "object";
 
-const unwrap = output => {
-  const result = output?.answers ? output : output?.result?.answers ? output.result : null;
-  return result?.usage && typeof result.model === "string" ? result : null;
+/** Accept binding output, `{ result }`, or REST `{ state:"Completed", result:{ model, answers, usage } }`. */
+export const unwrap = output => {
+  let cur = output;
+  for (let i = 0; i < 4 && cur && typeof cur === "object" && !cur.answers; i++) {
+    cur = cur.result ?? null;
+  }
+  return cur?.answers && cur?.usage && typeof cur.model === "string" ? cur : null;
 };
 
 const insufficientCredits = detail => /2021\s*:\s*Insufficient AI Gateway credits/i.test(detail);
-const gatewayUpstream = detail => /^2002\s*:/i.test(detail);
 
-/** Match Cloudflare's typesafe/jev catalog example: no explicit gateway option. */
 const runBinding = (env, input) => env.AI.run("typesafe/jev", input);
 
-async function runRest(env, input) {
+export async function runRest(env, input) {
   const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/ai/run`, {
     method: "POST",
     headers: {
@@ -32,38 +33,41 @@ async function runRest(env, input) {
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
-    const message = payload?.errors?.[0]?.message ?? `AI REST ${response.status}`;
+    const message = payload?.errors?.[0]?.message ?? `AI REST HTTP ${response.status}`;
+    console.error("Jev REST failed", {
+      restStatus: response.status,
+      restError: message,
+      restCode: payload?.errors?.[0]?.code ?? null,
+    });
     const err = new Error(message);
     err.name = "AiGatewayError";
     err.restStatus = response.status;
     throw err;
   }
+  // Cloudflare may return the model payload directly or nest it under result / Completed.
   return payload?.result ?? payload;
 }
 
-/**
- * Re-enter via Service Binding (same script, no public URL).
- * Public workers.dev hop from the Worker timed out with 522; service bindings stay on-platform.
- * A fresh internal invocation should not carry the LHR eyeball colo that breaks AI Gateway.
- */
-async function runServiceHop(env, input) {
-  if (!env.SELF?.fetch) {
-    const err = new Error("2002: Error");
+/** Run inference inside an APAC Durable Object (no LHR eyeball colo on AI Gateway). */
+export async function runDurable(env, input) {
+  if (!env.JEV?.idFromName) {
+    const err = new Error("JEV Durable Object binding is not configured");
     err.name = "AiGatewayError";
     throw err;
   }
-  const response = await env.SELF.fetch(new Request("https://jev-internal/v1/systemone", {
+  const stub = env.JEV.get(env.JEV.idFromName("jev"), { locationHint: "apac" });
+  const response = await stub.fetch(new Request("https://jev-do/run", {
     method: "POST",
-    headers: {
-      authorization: `Bearer ${env.PROXY_API_KEY}`,
-      "content-type": "application/json",
-      [HOP_HEADER]: "1",
-    },
-    body: JSON.stringify({ model: "typesafe/jev", state: input.state, questions: input.questions }),
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
   }));
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
-    const message = payload?.error?.message ?? `service hop ${response.status}`;
+    const message = payload?.error?.message ?? `durable hop HTTP ${response.status}`;
+    console.error("Jev Durable Object failed", {
+      restStatus: response.status,
+      restError: message,
+    });
     const err = new Error(message);
     err.name = "AiGatewayError";
     err.restStatus = response.status;
@@ -73,37 +77,71 @@ async function runServiceHop(env, input) {
 }
 
 /**
- * Run Jev inference without CF_AI_API_TOKEN and without workers.dev fetch.
- * On LHR ingress (or after binding 2002): optional REST, else Service Binding self-hop.
+ * Inference order when CF_AI_API_TOKEN is set (production):
+ *   1) Account AI REST (verified working outside CF)
+ *   2) APAC Durable Object (binding and/or REST away from LHR ingress)
+ * Without a token: binding on healthy ingress, else Durable Object.
  */
-export async function runJev(env, input, { colo = null, allowHop = true } = {}) {
-  const skipBinding = colo && BINDING_UNRELIABLE_COLOS.has(colo);
-  let bindingError = null;
-
-  if (!skipBinding) {
-    try {
-      return await runBinding(env, input);
-    } catch (cause) {
-      bindingError = cause;
-      if (!gatewayUpstream(String(cause?.message ?? ""))) throw cause;
-    }
-  }
+export async function runJev(env, input, { colo = null } = {}) {
+  const unreliable = Boolean(colo && BINDING_UNRELIABLE_COLOS.has(colo));
+  let lastError = null;
 
   if (env.CF_AI_API_TOKEN) {
     try {
       return await runRest(env, input);
     } catch (cause) {
-      if (!allowHop) throw cause;
-      return runServiceHop(env, input);
+      lastError = cause;
     }
   }
 
-  if (allowHop) return runServiceHop(env, input);
+  if (env.JEV?.idFromName && (env.CF_AI_API_TOKEN || unreliable || lastError)) {
+    try {
+      return await runDurable(env, input);
+    } catch (cause) {
+      lastError = cause;
+    }
+  }
 
-  if (bindingError) throw bindingError;
+  if (!unreliable && !env.CF_AI_API_TOKEN) {
+    try {
+      return await runBinding(env, input);
+    } catch (cause) {
+      lastError = cause;
+      if (env.JEV?.idFromName) return runDurable(env, input);
+      throw cause;
+    }
+  }
+
+  if (lastError) throw lastError;
   const err = new Error("2002: Error");
   err.name = "AiGatewayError";
   throw err;
+}
+
+/** APAC-placed isolate for typesafe/jev when the edge Worker is on a bad AI Gateway path. */
+export class JevInference {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const input = await request.json();
+    try {
+      try {
+        return Response.json(await runBinding(this.env, input));
+      } catch (bindingError) {
+        if (!this.env.CF_AI_API_TOKEN) throw bindingError;
+        return Response.json(await runRest(this.env, input));
+      }
+    } catch (cause) {
+      const detail = String(cause?.message ?? "");
+      return Response.json(
+        { error: { message: detail || "Durable inference failed" } },
+        { status: 502 },
+      );
+    }
+  }
 }
 
 export default {
@@ -151,13 +189,8 @@ export default {
         return error(422, "Score requires 2-10 criteria");
     }
     const colo = request.cf?.colo ?? null;
-    const allowHop = request.headers.get(HOP_HEADER) !== "1";
     try {
-      const output = await runJev(
-        env,
-        { state: body.state, questions: body.questions },
-        { colo, allowHop },
-      );
+      const output = await runJev(env, { state: body.state, questions: body.questions }, { colo });
       const result = unwrap(output);
       if (!result) return error(502, "Unexpected model response");
       return json(result);
@@ -168,10 +201,10 @@ export default {
       console.error("Jev inference failed", {
         errorName: cause instanceof Error ? cause.name : "UnknownError",
         upstreamCode: detail.match(/^(\d+)\s*:/)?.[1] ?? null,
-        upstreamStatus: env.AI.lastRequestHttpStatusCode ?? cause?.restStatus ?? null,
-        aiGatewayLogId: env.AI.aiGatewayLogId,
+        upstreamStatus: env.AI?.lastRequestHttpStatusCode ?? cause?.restStatus ?? null,
+        aiGatewayLogId: env.AI?.aiGatewayLogId ?? null,
         colo,
-        allowHop,
+        detail: detail.slice(0, 200),
       });
       return error(502, "Cloudflare model invocation failed");
     }
