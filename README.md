@@ -9,8 +9,8 @@ The Worker is configured for the `TopView.ai` account and the custom hostname `j
 ```sh
 npm install
 wrangler secret put PROXY_API_KEY
-# Optional but recommended: account token with Account → Workers AI → Read.
-# Used only when the edge AI binding returns AiGatewayError 2002 (seen in LHR).
+# Optional (preferred long-term): Account → Workers AI → Read.
+# Without it, LHR custom-domain traffic recovers via a workers.dev hop instead.
 wrangler secret put CF_AI_API_TOKEN
 npm run deploy
 ```
@@ -50,13 +50,23 @@ Keep `.dev.vars` and `.secrets/` private; both are git-ignored.
 }
 ```
 
-The response is the model's native JSON result with `model`, `answers`, and `usage`. Requests are capped at 1 MiB. The proxy does not cache requests or log bodies. Inference runs through the Cloudflare Workers AI binding, with an optional account REST fallback when the edge binding returns AI Gateway error `2002`.
+The response is the model's native JSON result with `model`, `answers`, and `usage`. Requests are capped at 1 MiB. The proxy does not cache requests or log bodies.
 
-Jev is a third-party model served through Cloudflare AI Gateway. The Worker explicitly uses the `default` gateway; third-party inference uses Unified Billing and deducts prepaid AI Gateway credits. The gateway's Workers AI billing setting applies to Workers AI models, not to Jev. If the balance is insufficient, the endpoint returns HTTP `402` with `error.code` set to `insufficient_credits`. Other upstream failures are returned as `502` and logged with their error code, status, and edge colo.
+## LHR / custom-domain recovery
 
-## Placement
+Production showed:
 
-`wrangler.jsonc` pins Worker execution near `aws:ap-southeast-1`. Production Workers Logs showed successful `typesafe/jev` calls from SIN/NRT and repeated `AiGatewayError: 2002` / HTTP 500 failures from LHR (the colo that served most `jev-proxy.topviewai.app` inference traffic). Placement keeps inference off the failing EU edge path.
+- Ingress `colo=LHR` + `env.AI.run` → `AiGatewayError` `2002` / HTTP 500 (`aiGatewayLogId` null)
+- `cf-placement: remote-SIN` does **not** fix that binding failure
+- Same client via `workers.dev` with `local-SIN` → HTTP 200 `jev-1.13.0`
+
+Recovery order:
+
+1. Skip the AI binding on known-bad ingress colos (`LHR`)
+2. If `CF_AI_API_TOKEN` is set → account REST `POST /ai/run` (preferred)
+3. Else hop once to `WORKERS_DEV_ORIGIN` (`https://jev-cloudflare-proxy.imabing.workers.dev`) with `PROXY_API_KEY` and `x-jev-edge-hop: 1` so binding sees a healthy ingress
+
+Jev is a third-party model on AI Gateway Unified Billing. Insufficient credits return HTTP `402` with `error.code=insufficient_credits`. Other upstream failures return `502` and log error code, status, and edge colo.
 
 ## Verify on the custom domain
 
@@ -84,13 +94,12 @@ curl -sS -D - https://jev-proxy.topviewai.app/v1/systemone \
   }'
 ```
 
-Expect HTTP `200` with `model`, `answers`, and `usage`. HTTP `402` means AI Gateway credits are exhausted. HTTP `502` with Workers Log fields `upstreamCode=2002` and `colo=LHR` means the edge AI Gateway path still failed — set `CF_AI_API_TOKEN` (Workers AI Read) and redeploy, and/or check AI Gateway credits in the dashboard.
+Expect HTTP `200` with `model`, `answers`, and `usage`. Keep `workers_dev` enabled while the hop fallback is in use.
 
-## Credentials Jeff may need to grant
+## Credentials
 
-| Gap | Needed permission / action |
+| Item | Action |
 | --- | --- |
-| Deploy / secrets | Wrangler login or API token with Workers Scripts Edit + Workers Routes Edit + Workers AI Read |
-| Optional REST fallback secret | `wrangler secret put CF_AI_API_TOKEN` — Account → Workers AI → Read |
-| AI Gateway dashboard / log API | Account → AI Gateway → Read (current tokens that only cover Workers often get auth errors on `/ai-gateway/*`) |
-| Billing confirmation | Dashboard → AI Gateway → Unified Billing credits for the `default` gateway |
+| Required | `PROXY_API_KEY` (already set) |
+| Preferred | `CF_AI_API_TOKEN` — Account → Workers AI → Read (avoids workers.dev hop) |
+| Optional debug | Account → AI Gateway → Read for gateway logs; dashboard Unified Billing for credits |

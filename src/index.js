@@ -1,4 +1,7 @@
 const ACCOUNT_ID = "5b6c981ebeb77b3e3566ffc9ba8be751";
+const HOP_HEADER = "x-jev-edge-hop";
+/** Ingress colos where env.AI.run(typesafe/jev) returns AiGatewayError 2002 even with remote-SIN placement. */
+const BINDING_UNRELIABLE_COLOS = new Set(["LHR"]);
 
 const json = (value, status = 200) => Response.json(value, {
   status, headers: { "cache-control": "no-store" },
@@ -15,31 +18,86 @@ const unwrap = output => {
 const insufficientCredits = detail => /2021\s*:\s*Insufficient AI Gateway credits/i.test(detail);
 const gatewayUpstream = detail => /^2002\s*:/i.test(detail);
 
-/** Prefer the Workers AI binding; on colo-local AI Gateway 2002, fall back to the account REST API. */
-export async function runJev(env, input) {
-  try {
-    return await env.AI.run("typesafe/jev", input, { gateway: { id: "default" } });
-  } catch (cause) {
-    const detail = String(cause?.message ?? "");
-    if (!gatewayUpstream(detail) || !env.CF_AI_API_TOKEN) throw cause;
-    const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/ai/run`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${env.CF_AI_API_TOKEN}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ model: "typesafe/jev", input }),
-    });
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) {
-      const message = payload?.errors?.[0]?.message ?? `AI REST ${response.status}`;
-      const err = new Error(message);
-      err.name = "AiGatewayError";
-      err.restStatus = response.status;
-      throw err;
-    }
-    return payload?.result ?? payload;
+const runBinding = (env, input) => env.AI.run("typesafe/jev", input, { gateway: { id: "default" } });
+
+async function runRest(env, input) {
+  const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/ai/run`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.CF_AI_API_TOKEN}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ model: "typesafe/jev", input }),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = payload?.errors?.[0]?.message ?? `AI REST ${response.status}`;
+    const err = new Error(message);
+    err.name = "AiGatewayError";
+    err.restStatus = response.status;
+    throw err;
   }
+  return payload?.result ?? payload;
+}
+
+/** Re-enter via workers.dev so AI binding sees a healthy ingress colo (proven: local-SIN works). */
+async function runWorkersDevHop(env, input) {
+  const response = await fetch(new URL("/v1/systemone", env.WORKERS_DEV_ORIGIN), {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.PROXY_API_KEY}`,
+      "content-type": "application/json",
+      [HOP_HEADER]: "1",
+    },
+    body: JSON.stringify({ model: "typesafe/jev", state: input.state, questions: input.questions }),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = payload?.error?.message ?? `workers.dev hop ${response.status}`;
+    const err = new Error(message);
+    err.name = "AiGatewayError";
+    err.restStatus = response.status;
+    throw err;
+  }
+  return payload;
+}
+
+/**
+ * Run Jev inference.
+ * - Binding works when the *ingress* colo is healthy (e.g. workers.dev → SIN).
+ * - remote-SIN placement does NOT fix LHR-ingress 2002; AI binding still fails.
+ * - Fallbacks: CF_AI_API_TOKEN REST (preferred), else WORKERS_DEV_ORIGIN hop (no new secret).
+ */
+export async function runJev(env, input, { colo = null, allowHop = true } = {}) {
+  const skipBinding = colo && BINDING_UNRELIABLE_COLOS.has(colo);
+  let bindingError = null;
+
+  if (!skipBinding) {
+    try {
+      return await runBinding(env, input);
+    } catch (cause) {
+      bindingError = cause;
+      if (!gatewayUpstream(String(cause?.message ?? ""))) throw cause;
+    }
+  }
+
+  if (env.CF_AI_API_TOKEN) {
+    try {
+      return await runRest(env, input);
+    } catch (cause) {
+      if (!allowHop || !env.WORKERS_DEV_ORIGIN || !env.PROXY_API_KEY) throw cause;
+      return runWorkersDevHop(env, input);
+    }
+  }
+
+  if (allowHop && env.WORKERS_DEV_ORIGIN && env.PROXY_API_KEY) {
+    return runWorkersDevHop(env, input);
+  }
+
+  if (bindingError) throw bindingError;
+  const err = new Error("2002: Error");
+  err.name = "AiGatewayError";
+  throw err;
 }
 
 export default {
@@ -86,8 +144,14 @@ export default {
       if (q.type === "score" && (!Array.isArray(q.criteria) || q.criteria.length < 2 || q.criteria.length > 10))
         return error(422, "Score requires 2-10 criteria");
     }
+    const colo = request.cf?.colo ?? null;
+    const allowHop = request.headers.get(HOP_HEADER) !== "1";
     try {
-      const output = await runJev(env, { state: body.state, questions: body.questions });
+      const output = await runJev(
+        env,
+        { state: body.state, questions: body.questions },
+        { colo, allowHop },
+      );
       const result = unwrap(output);
       if (!result) return error(502, "Unexpected model response");
       return json(result);
@@ -100,7 +164,8 @@ export default {
         upstreamCode: detail.match(/^(\d+)\s*:/)?.[1] ?? null,
         upstreamStatus: env.AI.lastRequestHttpStatusCode ?? cause?.restStatus ?? null,
         aiGatewayLogId: env.AI.aiGatewayLogId,
-        colo: request.cf?.colo ?? null,
+        colo,
+        allowHop,
       });
       return error(502, "Cloudflare model invocation failed");
     }
