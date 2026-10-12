@@ -4,14 +4,14 @@
   "main": "src/index.js",
   "compatibility_date": "2026-10-10",
   "workers_dev": true,
-  // Placement alone does not fix LHR-ingress AiGatewayError 2002 (remote-SIN still fails).
-  // Keep it for latency; recovery is WORKERS_DEV_ORIGIN hop and/or CF_AI_API_TOKEN REST.
+  // Placement does not cure LHR-ingress AI Gateway 2002; kept for latency only.
   "placement": {
     "region": "aws:ap-southeast-1"
   },
-  "vars": {
-    "WORKERS_DEV_ORIGIN": "https://jev-cloudflare-proxy.imabing.workers.dev"
-  },
+  // Self service binding: internal re-entry without public URL (workers.dev hop returned 522).
+  "services": [
+    { "binding": "SELF", "service": "jev-cloudflare-proxy" }
+  ],
   "routes": [
     { "pattern": "jev-proxy.topviewai.app", "custom_domain": true }
   ],

@@ -1,6 +1,6 @@
 const ACCOUNT_ID = "5b6c981ebeb77b3e3566ffc9ba8be751";
 const HOP_HEADER = "x-jev-edge-hop";
-/** Ingress colos where env.AI.run(typesafe/jev) returns AiGatewayError 2002 even with remote-SIN placement. */
+/** Ingress colos where env.AI.run(typesafe/jev) returns AiGatewayError 2002 (even with remote-SIN placement). */
 const BINDING_UNRELIABLE_COLOS = new Set(["LHR"]);
 
 const json = (value, status = 200) => Response.json(value, {
@@ -18,7 +18,8 @@ const unwrap = output => {
 const insufficientCredits = detail => /2021\s*:\s*Insufficient AI Gateway credits/i.test(detail);
 const gatewayUpstream = detail => /^2002\s*:/i.test(detail);
 
-const runBinding = (env, input) => env.AI.run("typesafe/jev", input, { gateway: { id: "default" } });
+/** Match Cloudflare's typesafe/jev catalog example: no explicit gateway option. */
+const runBinding = (env, input) => env.AI.run("typesafe/jev", input);
 
 async function runRest(env, input) {
   const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/ai/run`, {
@@ -40,9 +41,18 @@ async function runRest(env, input) {
   return payload?.result ?? payload;
 }
 
-/** Re-enter via workers.dev so AI binding sees a healthy ingress colo (proven: local-SIN works). */
-async function runWorkersDevHop(env, input) {
-  const response = await fetch(new URL("/v1/systemone", env.WORKERS_DEV_ORIGIN), {
+/**
+ * Re-enter via Service Binding (same script, no public URL).
+ * Public workers.dev hop from the Worker timed out with 522; service bindings stay on-platform.
+ * A fresh internal invocation should not carry the LHR eyeball colo that breaks AI Gateway.
+ */
+async function runServiceHop(env, input) {
+  if (!env.SELF?.fetch) {
+    const err = new Error("2002: Error");
+    err.name = "AiGatewayError";
+    throw err;
+  }
+  const response = await env.SELF.fetch(new Request("https://jev-internal/v1/systemone", {
     method: "POST",
     headers: {
       authorization: `Bearer ${env.PROXY_API_KEY}`,
@@ -50,10 +60,10 @@ async function runWorkersDevHop(env, input) {
       [HOP_HEADER]: "1",
     },
     body: JSON.stringify({ model: "typesafe/jev", state: input.state, questions: input.questions }),
-  });
+  }));
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
-    const message = payload?.error?.message ?? `workers.dev hop ${response.status}`;
+    const message = payload?.error?.message ?? `service hop ${response.status}`;
     const err = new Error(message);
     err.name = "AiGatewayError";
     err.restStatus = response.status;
@@ -63,10 +73,8 @@ async function runWorkersDevHop(env, input) {
 }
 
 /**
- * Run Jev inference.
- * - Binding works when the *ingress* colo is healthy (e.g. workers.dev → SIN).
- * - remote-SIN placement does NOT fix LHR-ingress 2002; AI binding still fails.
- * - Fallbacks: CF_AI_API_TOKEN REST (preferred), else WORKERS_DEV_ORIGIN hop (no new secret).
+ * Run Jev inference without CF_AI_API_TOKEN and without workers.dev fetch.
+ * On LHR ingress (or after binding 2002): optional REST, else Service Binding self-hop.
  */
 export async function runJev(env, input, { colo = null, allowHop = true } = {}) {
   const skipBinding = colo && BINDING_UNRELIABLE_COLOS.has(colo);
@@ -85,14 +93,12 @@ export async function runJev(env, input, { colo = null, allowHop = true } = {}) 
     try {
       return await runRest(env, input);
     } catch (cause) {
-      if (!allowHop || !env.WORKERS_DEV_ORIGIN || !env.PROXY_API_KEY) throw cause;
-      return runWorkersDevHop(env, input);
+      if (!allowHop) throw cause;
+      return runServiceHop(env, input);
     }
   }
 
-  if (allowHop && env.WORKERS_DEV_ORIGIN && env.PROXY_API_KEY) {
-    return runWorkersDevHop(env, input);
-  }
+  if (allowHop) return runServiceHop(env, input);
 
   if (bindingError) throw bindingError;
   const err = new Error("2002: Error");
