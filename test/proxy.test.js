@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import worker, { runJev, runRest, unwrap, JevInference } from "../src/index.js";
+import worker, {
+  runJev, runRest, unwrap, JevInference, DO_OBJECT_NAME, DO_LOCATION_HINT,
+} from "../src/index.js";
 
 const payload = { model: "jev-latest", state: "urgent", questions: { urgent: { type: "noul", instructions: "Urgent?" } } };
 const result = { model: "jev-1.13.0", answers: { urgent: { type: "noul", noul: 0.9 } }, usage: { input_tokens: 10, output_tokens: 5 } };
@@ -18,13 +20,15 @@ const req = (body = payload, key = "test", { cf } = {}) => {
 const mockJev = (handler) => ({
   idFromName: (name) => ({ name }),
   get: (id, opts) => {
-    assert.equal(id.name, "jev");
-    assert.deepEqual(opts, { locationHint: "apac" });
+    assert.equal(id.name, DO_OBJECT_NAME);
+    assert.notEqual(id.name, "jev");
+    assert.deepEqual(opts, { locationHint: DO_LOCATION_HINT });
+    assert.equal(DO_LOCATION_HINT, "apac-se");
     return { fetch: handler };
   },
 });
 
-test("preserves TypeSafe result via binding when no REST token", async () => {
+test("preserves TypeSafe result via binding on healthy ingress", async () => {
   const response = await worker.fetch(req(), {
     PROXY_API_KEY: "test",
     AI: {
@@ -71,64 +75,48 @@ test("returns an actionable status for insufficient Cloudflare AI Gateway credit
   });
 });
 
-test("uses CF_AI_API_TOKEN REST before any AI binding or Durable Object", async () => {
+test("LHR skips edge REST and goes straight to fresh APAC-SE Durable Object", async () => {
   const originalFetch = globalThis.fetch;
-  let restCalls = 0;
-  globalThis.fetch = async (url, init) => {
-    restCalls += 1;
-    assert.match(String(url), /\/ai\/run$/);
-    assert.equal(init.headers.authorization, "Bearer rest-token");
-    assert.deepEqual(JSON.parse(init.body), { model: "typesafe/jev", input });
-    return Response.json({
-      success: true,
-      result: { state: "Completed", result },
-    });
-  };
-  try {
-    const env = {
-      CF_AI_API_TOKEN: "rest-token",
-      PROXY_API_KEY: "test",
-      AI: { run: () => { throw new Error("binding must not run"); } },
-      JEV: mockJev(async () => { throw new Error("DO must not run"); }),
-    };
-    const output = await runJev(env, input, { colo: "LHR" });
-    assert.deepEqual(unwrap(output), result);
-    assert.equal(restCalls, 1);
-
-    const response = await worker.fetch(req(payload, "test", { cf: { colo: "LHR" } }), env);
-    assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), result);
-    assert.equal(restCalls, 2);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("falls back to APAC Durable Object when Worker-originated REST fails", async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({
-    success: false,
-    errors: [{ code: 500, message: "Worker-origin REST 500" }],
-  }), { status: 500 });
+  globalThis.fetch = async () => { throw new Error("edge REST must not run for LHR"); };
   try {
     let doCalls = 0;
     const env = {
       CF_AI_API_TOKEN: "rest-token",
       PROXY_API_KEY: "test",
-      AI: { run: () => { throw new Error("edge binding must not run"); } },
+      AI: { run: () => { throw new Error("edge binding must not run for LHR"); } },
       JEV: mockJev(async (request) => {
         doCalls += 1;
         assert.deepEqual(await request.json(), input);
         return Response.json({ state: "Completed", result });
       }),
     };
+    const output = await runJev(env, input, { colo: "LHR" });
+    assert.deepEqual(unwrap(output), result);
+    assert.equal(doCalls, 1);
+
     const response = await worker.fetch(req(payload, "test", { cf: { colo: "LHR" } }), env);
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), result);
-    assert.equal(doCalls, 1);
+    assert.equal(doCalls, 2);
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("healthy ingress falls back to Durable Object after binding failure", async () => {
+  let doCalls = 0;
+  const env = {
+    PROXY_API_KEY: "test",
+    AI: { run: () => { throw Object.assign(new Error("2002: Error"), { name: "AiGatewayError" }); } },
+    JEV: mockJev(async () => {
+      doCalls += 1;
+      return Response.json(result);
+    }),
+  };
+  const response = await worker.fetch(req(), env);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), result);
+  assert.equal(doCalls, 1);
 });
 
 test("Durable Object runner prefers binding then REST", async () => {
@@ -175,4 +163,9 @@ test("runRest logs status without leaking the token on failure", async () => {
     globalThis.fetch = originalFetch;
     console.error = originalError;
   }
+});
+
+test("exports a new DO object name distinct from the stuck jev id", () => {
+  assert.equal(DO_OBJECT_NAME, "jev-apac-v2");
+  assert.equal(DO_LOCATION_HINT, "apac-se");
 });

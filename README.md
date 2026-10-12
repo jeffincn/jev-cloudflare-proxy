@@ -7,28 +7,30 @@ Authenticated TypeSafe-compatible `POST /v1/systemone` backed by Cloudflare `typ
 ```sh
 npm install
 wrangler secret put PROXY_API_KEY
-wrangler secret put CF_AI_API_TOKEN   # Account → Workers AI → Read (required for custom-domain recovery)
+wrangler secret put CF_AI_API_TOKEN   # Account → Workers AI → Read (used inside APAC DO only)
 npm run deploy
 ```
 
-## Inference recovery (custom domain / LHR)
+## Why custom domain failed
 
-Production showed:
+| Path | Result |
+| --- | --- |
+| Edge `env.AI.run` on LHR ingress | `AiGatewayError` `2002` |
+| Worker-originated account REST from LHR | same `2002` (`Model execution failed`) |
+| Same token REST from Mac / outside CF | **200** `jev-1.13.0` |
+| Durable Object id `"jev"` first created under LHR | hint ignored on later `get()`; DO stayed on broken path |
 
-1. `env.AI.run` fails on LHR ingress (`AiGatewayError` / HTTP 500) even with `remote-SIN` placement
-2. Worker → `workers.dev` hop times out (**522**)
-3. Service Binding self-hop retries the broken binding when `colo` is null
-4. Account REST `POST /accounts/.../ai/run` with `CF_AI_API_TOKEN` returns **200** `jev-1.13.0` from outside Cloudflare
+## Current recovery
 
-Current order:
+1. On ingress `colo=LHR`: **skip edge REST/binding** → Durable Object `idFromName("jev-apac-v2")` with `locationHint: "apac-se"` (new id so the hint applies).
+2. Inside the DO: **`env.AI.run` first**, REST only if binding fails.
+3. Healthy ingress: edge binding, then the same APAC-SE DO on failure.
 
-1. **REST first** when `CF_AI_API_TOKEN` is set (never blocked on binding / hop)
-2. If Worker-originated REST fails → **Durable Object** `JevInference` with `locationHint: "apac"` (binding, then REST)
-3. Binding alone only on healthy ingress when no token is configured
+Look for logs: `Jev edge → Durable Object`, `Jev DO path start`, `Jev DO path ok` (`via: binding|rest`).
 
-`unwrap` accepts direct results and REST nests such as `{ state: "Completed", result: { model, answers, usage } }`.
+If a **fresh** APAC-SE DO still cannot run binding or Worker REST, the next escape hatch is an **off-platform relay** (Mac/box/CI calling account `/ai/run` and returning the result), because AI Gateway `2002` appears intrinsic to Cloudflare Worker isolates on this account/path.
 
-## Verify on the custom domain
+## Verify
 
 ```sh
 curl -sS https://jev-proxy.topviewai.app/health

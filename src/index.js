@@ -1,6 +1,12 @@
 const ACCOUNT_ID = "5b6c981ebeb77b3e3566ffc9ba8be751";
-/** Ingress colos where env.AI.run(typesafe/jev) fails (even with remote-SIN placement). */
+/** Ingress colos where edge env.AI.run / Worker-originated REST both return AiGatewayError 2002. */
 const BINDING_UNRELIABLE_COLOS = new Set(["LHR"]);
+/**
+ * Fresh DO id + SE-Asia hint. locationHint is honored only on the FIRST get() for an id;
+ * do not reuse "jev" (likely first-created under LHR and stuck on the broken path).
+ */
+export const DO_OBJECT_NAME = "jev-apac-v2";
+export const DO_LOCATION_HINT = "apac-se";
 
 const json = (value, status = 200) => Response.json(value, {
   status, headers: { "cache-control": "no-store" },
@@ -42,20 +48,21 @@ export async function runRest(env, input) {
     const err = new Error(message);
     err.name = "AiGatewayError";
     err.restStatus = response.status;
+    err.restCode = payload?.errors?.[0]?.code ?? null;
     throw err;
   }
-  // Cloudflare may return the model payload directly or nest it under result / Completed.
   return payload?.result ?? payload;
 }
 
-/** Run inference inside an APAC Durable Object (no LHR eyeball colo on AI Gateway). */
+/** Run inference inside a never-before-created APAC-SE Durable Object. */
 export async function runDurable(env, input) {
   if (!env.JEV?.idFromName) {
     const err = new Error("JEV Durable Object binding is not configured");
     err.name = "AiGatewayError";
     throw err;
   }
-  const stub = env.JEV.get(env.JEV.idFromName("jev"), { locationHint: "apac" });
+  const stub = env.JEV.get(env.JEV.idFromName(DO_OBJECT_NAME), { locationHint: DO_LOCATION_HINT });
+  console.log("Jev edge → Durable Object", { objectName: DO_OBJECT_NAME, locationHint: DO_LOCATION_HINT });
   const response = await stub.fetch(new Request("https://jev-do/run", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -65,6 +72,8 @@ export async function runDurable(env, input) {
   if (!response.ok) {
     const message = payload?.error?.message ?? `durable hop HTTP ${response.status}`;
     console.error("Jev Durable Object failed", {
+      objectName: DO_OBJECT_NAME,
+      locationHint: DO_LOCATION_HINT,
       restStatus: response.status,
       restError: message,
     });
@@ -77,48 +86,30 @@ export async function runDurable(env, input) {
 }
 
 /**
- * Inference order when CF_AI_API_TOKEN is set (production):
- *   1) Account AI REST (verified working outside CF)
- *   2) APAC Durable Object (binding and/or REST away from LHR ingress)
- * Without a token: binding on healthy ingress, else Durable Object.
+ * Custom-domain / LHR: skip edge REST (Worker-originated /ai/run also returns 2002) and
+ * go straight to a fresh APAC-SE Durable Object. Healthy ingress: try edge binding, then DO.
  */
 export async function runJev(env, input, { colo = null } = {}) {
   const unreliable = Boolean(colo && BINDING_UNRELIABLE_COLOS.has(colo));
-  let lastError = null;
 
-  if (env.CF_AI_API_TOKEN) {
-    try {
-      return await runRest(env, input);
-    } catch (cause) {
-      lastError = cause;
-    }
+  if (unreliable) {
+    return runDurable(env, input);
   }
 
-  if (env.JEV?.idFromName && (env.CF_AI_API_TOKEN || unreliable || lastError)) {
-    try {
-      return await runDurable(env, input);
-    } catch (cause) {
-      lastError = cause;
-    }
+  try {
+    return await runBinding(env, input);
+  } catch (cause) {
+    if (!env.JEV?.idFromName) throw cause;
+    console.error("Jev edge binding failed; using APAC Durable Object", {
+      colo,
+      errorName: cause instanceof Error ? cause.name : "UnknownError",
+      detail: String(cause?.message ?? "").slice(0, 200),
+    });
+    return runDurable(env, input);
   }
-
-  if (!unreliable && !env.CF_AI_API_TOKEN) {
-    try {
-      return await runBinding(env, input);
-    } catch (cause) {
-      lastError = cause;
-      if (env.JEV?.idFromName) return runDurable(env, input);
-      throw cause;
-    }
-  }
-
-  if (lastError) throw lastError;
-  const err = new Error("2002: Error");
-  err.name = "AiGatewayError";
-  throw err;
 }
 
-/** APAC-placed isolate for typesafe/jev when the edge Worker is on a bad AI Gateway path. */
+/** Fresh APAC-SE isolate for typesafe/jev (binding first, REST only as secondary). */
 export class JevInference {
   constructor(ctx, env) {
     this.ctx = ctx;
@@ -127,15 +118,29 @@ export class JevInference {
 
   async fetch(request) {
     const input = await request.json();
+    console.log("Jev DO path start", { objectName: DO_OBJECT_NAME, locationHint: DO_LOCATION_HINT });
     try {
       try {
-        return Response.json(await runBinding(this.env, input));
+        const output = await runBinding(this.env, input);
+        console.log("Jev DO path ok", { objectName: DO_OBJECT_NAME, via: "binding" });
+        return Response.json(output);
       } catch (bindingError) {
         if (!this.env.CF_AI_API_TOKEN) throw bindingError;
-        return Response.json(await runRest(this.env, input));
+        console.error("Jev DO binding failed; trying REST", {
+          objectName: DO_OBJECT_NAME,
+          detail: String(bindingError?.message ?? "").slice(0, 200),
+        });
+        const output = await runRest(this.env, input);
+        console.log("Jev DO path ok", { objectName: DO_OBJECT_NAME, via: "rest" });
+        return Response.json(output);
       }
     } catch (cause) {
       const detail = String(cause?.message ?? "");
+      console.error("Jev DO path failed", {
+        objectName: DO_OBJECT_NAME,
+        locationHint: DO_LOCATION_HINT,
+        detail: detail.slice(0, 200),
+      });
       return Response.json(
         { error: { message: detail || "Durable inference failed" } },
         { status: 502 },
@@ -200,7 +205,7 @@ export default {
         return json({ error: { message: "Cloudflare AI Gateway has insufficient credits", code: "insufficient_credits" } }, 402);
       console.error("Jev inference failed", {
         errorName: cause instanceof Error ? cause.name : "UnknownError",
-        upstreamCode: detail.match(/^(\d+)\s*:/)?.[1] ?? null,
+        upstreamCode: detail.match(/^(\d+)\s*:/)?.[1] ?? cause?.restCode ?? null,
         upstreamStatus: env.AI?.lastRequestHttpStatusCode ?? cause?.restStatus ?? null,
         aiGatewayLogId: env.AI?.aiGatewayLogId ?? null,
         colo,
