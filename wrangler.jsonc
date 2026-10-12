@@ -1,0 +1,12 @@
+{
+  "name": "jev-cloudflare-proxy",
+  "account_id": "5b6c981ebeb77b3e3566ffc9ba8be751",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-10",
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "jev-proxy.topviewai.app", "custom_domain": true }
+  ],
+  "ai": { "binding": "AI" },
+  "observability": { "enabled": true, "head_sampling_rate": 1 }
+}
