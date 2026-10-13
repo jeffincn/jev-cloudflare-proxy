@@ -1,52 +1,65 @@
 # Jev Cloudflare proxy
 
-An authenticated TypeSafe-compatible `POST /v1/systemone` endpoint backed by Cloudflare's `typesafe/jev` model.
+Authenticated TypeSafe-compatible `POST /v1/systemone` backed by Cloudflare `typesafe/jev`.
 
-## Deploy
-
-The Worker is configured for the `TopView.ai` account and the custom hostname `jev-proxy.topviewai.app`.
+## Deploy Worker
 
 ```sh
 npm install
 wrangler secret put PROXY_API_KEY
+wrangler secret put RELAY_URL    # https://<public-host>/v1/systemone
+wrangler secret put RELAY_KEY    # shared with the relay process
 npm run deploy
 ```
 
-Set a strong, private value for `PROXY_API_KEY` when prompted. Clients send it as `Authorization: Bearer <key>`.
-Keep `.dev.vars` and `.secrets/` private; both are git-ignored.
+`CF_AI_API_TOKEN` is **not** required on the Worker when LHR traffic uses the relay. Put that token on the **relay host** instead (see [`relay/README.md`](relay/README.md)).
 
-## API
+## Why an off-platform relay
 
-`GET /health` returns a basic health status.
+Same Mac, same payload, same `PROXY_API_KEY`:
 
-`POST /v1/systemone` accepts a TypeSafe SystemOne request. `model` may be `jev-latest` or `typesafe/jev`; both invoke the Cloudflare-hosted `typesafe/jev` model.
+| Target | Result |
+| --- | --- |
+| `jev-proxy.topviewai.app` (cf-ray `*-LHR`) | **502** `AiGatewayError` `2002` |
+| `*.imabing.workers.dev` (cf-ray `*-SIN`) | **200** `jev-1.13.0` |
+| Account REST `/ai/run` from outside CF | **200** |
+| Worker / DO / Worker-origin REST on LHR path | **2002** |
 
-```json
-{
-  "model": "jev-latest",
-  "state": "Help! My payouts have been failing for 3 days.",
-  "questions": {
-    "is_urgent": {
-      "type": "noul",
-      "instructions": "Does this convey urgency?"
-    },
-    "department": {
-      "type": "choice",
-      "instructions": "Which team should handle this?",
-      "criteria": {
-        "billing": "Payments, invoicing, refunds",
-        "technical": "Bugs, outages, integrations"
-      }
-    },
-    "frustration": {
-      "type": "score",
-      "instructions": "How frustrated is the customer?",
-      "criteria": ["Calm", "Frustrated", "Very angry"]
-    }
-  }
-}
+On-platform AI only works when the **ingress** colo is healthy (SIN). Durable Objects and Service Bindings did not escape LHR AI Gateway failure. Public Worker→workers.dev hop previously **522**’d.
+
+## Inference order
+
+1. Ingress `colo=LHR` → **off-platform relay** (`RELAY_URL` + `RELAY_KEY`)
+2. Other colos → `env.AI.run`; on `2002` / “Model execution failed” → relay if configured
+
+## Stand up the relay (Jeff/box)
+
+```sh
+export RELAY_KEY='...'
+export CF_AI_API_TOKEN='...'   # Account → Workers AI → Read
+node relay/server.mjs
+cloudflared tunnel --url http://127.0.0.1:8788
+# then wrangler secret put RELAY_URL / RELAY_KEY and deploy
 ```
 
-The response is the model's native JSON result with `model`, `answers`, and `usage`. Requests are capped at 1 MiB. The proxy does not cache requests or log bodies. Inference runs directly through the Cloudflare Workers AI binding.
+## Verify custom domain
 
-Jev is a third-party model served through Cloudflare AI Gateway. The Worker explicitly uses the `default` gateway; third-party inference uses Unified Billing and deducts prepaid AI Gateway credits. The gateway's Workers AI billing setting applies to Workers AI models, not to Jev. If the balance is insufficient, the endpoint returns HTTP `402` with `error.code` set to `insufficient_credits`. Other upstream failures are returned as `502` and logged with their error code and status.
+```sh
+curl -sS https://jev-proxy.topviewai.app/health
+
+curl -sS -D - https://jev-proxy.topviewai.app/v1/systemone \
+  -H "authorization: Bearer $PROXY_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "jev-latest",
+    "state": "Help! My payouts have been failing for 3 days.",
+    "questions": {
+      "is_urgent": {
+        "type": "noul",
+        "instructions": "Does this convey urgency?"
+      }
+    }
+  }'
+```
+
+Expect HTTP `200` with `model`, `answers`, and `usage`. Workers Logs should show `Jev edge → off-platform relay`.
